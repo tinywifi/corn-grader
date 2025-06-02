@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: corn-grader
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10
+      - key: ROBOFLOW_API_KEY
+        value: YOUR_REAL_API_KEY_HERE
