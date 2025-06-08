@@ -1,7 +1,9 @@
 from flask import Flask, request, render_template_string, send_from_directory
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from inference_sdk import InferenceHTTPClient, InferenceConfiguration
 import os, uuid, json, random
+import numpy as np
+from flask_cors import CORS
 
 API_KEY = os.environ.get("ROBOFLOW_API_KEY")
 PROJECT_ID = "corn-hub/4"
@@ -14,6 +16,8 @@ CLIENT.configure(InferenceConfiguration(confidence_threshold=0.10))
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULT_FOLDER, exist_ok=True)
 app = Flask(__name__)
+CORS(app)
+
 USDA_GRADES = [
     ("U.S. No. 1", 3.0, 1, 0.1, 0),
     ("U.S. No. 2", 5.0, 2, 0.2, 0),
@@ -21,6 +25,42 @@ USDA_GRADES = [
     ("U.S. No. 4", 10.0, 5, 1.0, 0),
     ("U.S. No. 5", 15.0, 7, 3.0, 1)
 ]
+
+def non_max_suppression(predictions, iou_threshold=0.3):
+    boxes = []
+    for pred in predictions:
+        x0 = pred['x'] - pred['width'] / 2
+        y0 = pred['y'] - pred['height'] / 2
+        x1 = pred['x'] + pred['width'] / 2
+        y1 = pred['y'] + pred['height'] / 2
+        boxes.append((x0, y0, x1, y1, pred['confidence'], pred['class']))
+
+    boxes = sorted(boxes, key=lambda b: b[4], reverse=True)
+    keep = []
+
+    while boxes:
+        chosen = boxes.pop(0)
+        keep.append(chosen)
+        boxes = [box for box in boxes if box[5] != chosen[5] or iou(box, chosen) < iou_threshold]
+
+    return [{
+        'x': (b[0]+b[2])/2,
+        'y': (b[1]+b[3])/2,
+        'width': b[2]-b[0],
+        'height': b[3]-b[1],
+        'confidence': b[4],
+        'class': b[5]
+    } for b in keep]
+
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    return interArea / float(boxAArea + boxBArea - interArea)
 
 def classify_grade(damage_pct, damage_kernels, heat_pct, heat_kernels, total_kernels):
     if total_kernels < 100:
@@ -44,7 +84,9 @@ def index():
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
 
-        result = CLIENT.infer(filepath, model_id=PROJECT_ID)
+        raw_result = CLIENT.infer(filepath, model_id=PROJECT_ID)
+        result = raw_result.copy()
+        result['predictions'] = non_max_suppression(result['predictions'])
 
         img = Image.open(filepath).convert("RGB")
         draw = ImageDraw.Draw(img)
@@ -68,7 +110,6 @@ def index():
                 class_colors[label] = "#%06x" % random.randint(0, 0xFFFFFF)
 
             color = class_colors[label]
-
             x0 = pred['x'] - pred['width'] / 2
             y0 = pred['y'] - pred['height'] / 2
             x1 = pred['x'] + pred['width'] / 2
@@ -106,13 +147,13 @@ def index():
                     <img src="/results/{{ filename }}" style="max-width: 100%; height: auto;">
                 </div>
                 <div style="flex: 1;">
-                    <h2>Raw JSON</h2>
-                    <pre>{{ result | tojson(indent=2) }}</pre>
+                    <h2><button onclick="this.nextElementSibling.style.display='block'">Show Raw JSON</button></h2>
+                    <pre style="display: none">{{ raw_result | tojson(indent=2) }}</pre>
                 </div>
             </div>
             <p><a href="/">Back</a></p>
         ''', counts=counts, grade=grade, total_damage_pct=total_damage_pct,
-             heat_damage_pct=heat_damage_pct, filename=filename, result=result, total_kernels=total_kernels)
+             heat_damage_pct=heat_damage_pct, filename=filename, raw_result=raw_result, total_kernels=total_kernels)
 
     return '''
         <h1>Upload Corn Kernel Image</h1>
@@ -129,4 +170,5 @@ def result_image(filename):
     return send_from_directory(RESULT_FOLDER, filename)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    from waitress import serve
+    serve(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
