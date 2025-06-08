@@ -3,3 +3,4 @@ waitress
 pillow
 numpy
 inference-sdk
+flask_cors
