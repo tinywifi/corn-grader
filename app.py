@@ -41,16 +41,17 @@ def non_max_suppression(predictions, iou_threshold=0.3):
     while boxes:
         chosen = boxes.pop(0)
         keep.append(chosen)
-        boxes = [box for box in boxes if box[5] != chosen[5] or iou(box, chosen) < iou_threshold]
+        # Remove boxes that overlap with chosen, regardless of class
+        boxes = [box for box in boxes if iou(box, chosen) < iou_threshold]
 
-    return [{
+    return [ {
         'x': (b[0]+b[2])/2,
         'y': (b[1]+b[3])/2,
         'width': b[2]-b[0],
         'height': b[3]-b[1],
         'confidence': b[4],
         'class': b[5]
-    } for b in keep]
+    } for b in keep ]
 
 def iou(boxA, boxB):
     xA = max(boxA[0], boxB[0])
