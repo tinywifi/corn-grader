@@ -144,7 +144,7 @@ def index():
                     <p><strong>Total damage %:</strong> {{ total_damage_pct | round(2) }}%</p>
                     <p><strong>Heat damage %:</strong> {{ heat_damage_pct | round(2) }}%</p>
                     <h2>Visual</h2>
-                    <img src="/results/{{ filename }}" style="max-width: 100%; height: auto;">
+                    <img src="https://corn-grader.onrender.com/results/{{ filename }}" style="max-width: 100%; height: auto;">
                 </div>
                 <div style="flex: 1;">
                     <h2><button onclick="this.nextElementSibling.style.display='block'">Show Raw JSON</button></h2>
