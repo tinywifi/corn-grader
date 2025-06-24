@@ -1,10 +1,9 @@
-from flask import Flask, request, render_template_string, send_from_directory, jsonify
-from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask import Flask, request, render_template_string, send_from_directory, jsonify, Response
 from PIL import Image, ImageDraw
 from PIL.ExifTags import TAGS
 from inference_sdk import InferenceHTTPClient, InferenceConfiguration
 from inference_sdk.http.errors import HTTPCallErrorError
-import os, uuid, json, random, io, threading, time
+import os, uuid, json, random, io, threading, time, queue
 import numpy as np
 from flask_cors import CORS
 try:
@@ -28,8 +27,7 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
 CORS(app, origins=["https://corn-grader.lovable.app"])
 
-socketio = SocketIO(app, cors_allowed_origins=["https://corn-grader.lovable.app"])
-
+progress_queues = {}
 progress_store = {}
 
 USDA_GRADES = [
@@ -91,13 +89,15 @@ def classify_grade(damage_pct, damage_kernels, heat_pct, heat_kernels, total_ker
 def compress_image(image_path, max_size_mb=5, quality=85, progress_id=None):
     def update_progress(step, total):
         progress = int((step / total) * 30) + 10
-        if progress_id:
-            socketio.emit('progress_update', {
-                'progress_id': progress_id,
-                'progress': progress,
-                'status': 'processing',
-                'message': 'Compressing image...'
-            }, room=progress_id)
+        if progress_id and progress_id in progress_queues:
+            try:
+                progress_queues[progress_id].put({
+                    'progress': progress,
+                    'status': 'processing',
+                    'message': 'Compressing image...'
+                }, block=False)
+            except queue.Full:
+                pass
     
     with Image.open(image_path) as img:
         img = img.convert("RGB")
@@ -129,12 +129,15 @@ def compress_image(image_path, max_size_mb=5, quality=85, progress_id=None):
 
 def process_image_async(filepath, filename, moisture, weight, progress_id):
     def emit_progress(progress, message, status='processing'):
-        socketio.emit('progress_update', {
-            'progress_id': progress_id,
-            'progress': progress,
-            'status': status,
-            'message': message
-        }, room=progress_id)
+        if progress_id in progress_queues:
+            try:
+                progress_queues[progress_id].put({
+                    'progress': progress,
+                    'status': status,
+                    'message': message
+                }, block=False)
+            except queue.Full:
+                pass
     
     try:
         emit_progress(5, 'Starting image processing...')
@@ -154,11 +157,14 @@ def process_image_async(filepath, filename, moisture, weight, progress_id):
                     emit_progress(70, 'Processing AI results...')
                 except HTTPCallErrorError as retry_error:
                     if retry_error.status_code == 413:
-                        socketio.emit('progress_update', {
-                            'progress_id': progress_id,
-                            'status': 'error',
-                            'error': 'Image too large after compression'
-                        }, room=progress_id)
+                        if progress_id in progress_queues:
+                            try:
+                                progress_queues[progress_id].put({
+                                    'status': 'error',
+                                    'error': 'Image too large after compression'
+                                }, block=False)
+                            except queue.Full:
+                                pass
                         return
                     raise retry_error
             else:
@@ -221,20 +227,26 @@ def process_image_async(filepath, filename, moisture, weight, progress_id):
             'raw_result': raw_result
         }
         
-        socketio.emit('progress_update', {
-            'progress_id': progress_id,
-            'progress': 100,
-            'status': 'completed',
-            'message': 'Analysis complete!',
-            'result': result_data
-        }, room=progress_id)
+        if progress_id in progress_queues:
+            try:
+                progress_queues[progress_id].put({
+                    'progress': 100,
+                    'status': 'completed',
+                    'message': 'Analysis complete!',
+                    'result': result_data
+                }, block=False)
+            except queue.Full:
+                pass
         
     except Exception as e:
-        socketio.emit('progress_update', {
-            'progress_id': progress_id,
-            'status': 'error',
-            'error': str(e)
-        }, room=progress_id)
+        if progress_id in progress_queues:
+            try:
+                progress_queues[progress_id].put({
+                    'status': 'error',
+                    'error': str(e)
+                }, block=False)
+            except queue.Full:
+                pass
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
@@ -243,6 +255,7 @@ def analyze():
     weight = float(request.form.get("weight", 0))
     
     progress_id = str(uuid.uuid4())
+    progress_queues[progress_id] = queue.Queue(maxsize=100)
     
     file_ext = os.path.splitext(file.filename)[-1].lower()
     if file_ext in ['.heic', '.heif'] and not HEIC_SUPPORT:
@@ -257,15 +270,40 @@ def analyze():
     
     return jsonify({'progress_id': progress_id})
 
-@socketio.on('join_progress')
-def on_join_progress(data):
-    progress_id = data['progress_id']
-    join_room(progress_id)
-    emit('joined', {'progress_id': progress_id})
-
-@socketio.on('disconnect')
-def on_disconnect():
-    print('Client disconnected')
+@app.route("/stream/<progress_id>")
+def stream_progress(progress_id):
+    def generate():
+        if progress_id not in progress_queues:
+            yield f"data: {json.dumps({'error': 'Invalid progress ID'})}\n\n"
+            return
+            
+        try:
+            while True:
+                try:
+                    data = progress_queues[progress_id].get(timeout=30)
+                    yield f"data: {json.dumps(data)}\n\n"
+                    
+                    if data.get('status') in ['completed', 'error']:
+                        del progress_queues[progress_id]
+                        break
+                        
+                except queue.Empty:
+                    yield f"data: {json.dumps({'ping': True})}\n\n"
+                    
+        except GeneratorExit:
+            if progress_id in progress_queues:
+                del progress_queues[progress_id]
+    
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': 'https://corn-grader.lovable.app',
+            'Access-Control-Allow-Credentials': 'true'
+        }
+    )
 
 @app.route("/progress/<progress_id>")
 def get_progress(progress_id):
@@ -394,5 +432,5 @@ def result_image(filename):
     return send_from_directory(RESULT_FOLDER, filename)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    socketio.run(app, host="0.0.0.0", port=port, debug=False)
+    from waitress import serve
+    serve(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

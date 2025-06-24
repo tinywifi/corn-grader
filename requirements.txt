@@ -1,5 +1,4 @@
 Flask
-Flask-SocketIO
 waitress
 pillow
 pillow-heif
