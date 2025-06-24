@@ -1,6 +1,7 @@
 Flask
 waitress
 pillow
+pillow-heif
 numpy
 inference-sdk
 flask_cors

@@ -1,10 +1,17 @@
-from flask import Flask, request, render_template_string, send_from_directory
+from flask import Flask, request, render_template_string, send_from_directory, jsonify
 from PIL import Image, ImageDraw
+from PIL.ExifTags import TAGS
 from inference_sdk import InferenceHTTPClient, InferenceConfiguration
 from inference_sdk.http.errors import HTTPCallErrorError
-import os, uuid, json, random, io
+import os, uuid, json, random, io, threading, time
 import numpy as np
 from flask_cors import CORS
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    HEIC_SUPPORT = True
+except ImportError:
+    HEIC_SUPPORT = False
 
 API_KEY = os.environ.get("ROBOFLOW_API_KEY")
 PROJECT_ID = "corn-hub/4"
@@ -18,6 +25,8 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULT_FOLDER, exist_ok=True)
 app = Flask(__name__)
 CORS(app)
+
+progress_store = {}
 
 USDA_GRADES = [
     ("U.S. No. 1", 3.0, 1, 0.1, 0),
@@ -75,23 +84,165 @@ def classify_grade(damage_pct, damage_kernels, heat_pct, heat_kernels, total_ker
                 return grade
     return "Sample Grade"
 
-def compress_image(image_path, max_size_mb=5, quality=85):
+def compress_image(image_path, max_size_mb=5, quality=85, progress_id=None):
+    def update_progress(step, total):
+        if progress_id and progress_id in progress_store:
+            progress_store[progress_id]['progress'] = int((step / total) * 30) + 10
+    
     with Image.open(image_path) as img:
         img = img.convert("RGB")
+        original_size = img.size
         
-        while True:
+        update_progress(1, 5)
+        
+        target_pixels = 1920 * 1920
+        current_pixels = img.size[0] * img.size[1]
+        
+        if current_pixels > target_pixels:
+            ratio = (target_pixels / current_pixels) ** 0.5
+            new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+            update_progress(2, 5)
+        
+        for attempt in range(3):
             buffer = io.BytesIO()
             img.save(buffer, format='JPEG', quality=quality, optimize=True)
             size_mb = buffer.tell() / (1024 * 1024)
+            update_progress(3 + attempt, 5)
             
-            if size_mb <= max_size_mb or quality <= 10:
+            if size_mb <= max_size_mb or quality <= 20:
                 with open(image_path, 'wb') as f:
                     f.write(buffer.getvalue())
                 return size_mb
             
-            quality -= 10
-            if img.size[0] > 1920 or img.size[1] > 1920:
-                img = img.resize((int(img.size[0] * 0.8), int(img.size[1] * 0.8)), Image.Resampling.LANCZOS)
+            quality = max(20, quality - 20)
+
+def process_image_async(file, moisture, weight, progress_id):
+    try:
+        progress_store[progress_id] = {'progress': 0, 'status': 'processing', 'result': None, 'error': None}
+        
+        file_ext = os.path.splitext(file.filename)[-1].lower()
+        if file_ext in ['.heic', '.heif'] and not HEIC_SUPPORT:
+            progress_store[progress_id]['error'] = "HEIC files not supported. Install pillow-heif."
+            progress_store[progress_id]['status'] = 'error'
+            return
+            
+        filename = str(uuid.uuid4()) + ('.jpg' if file_ext in ['.heic', '.heif'] else file_ext)
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        file.save(filepath)
+        
+        progress_store[progress_id]['progress'] = 5
+        
+        compress_image(filepath, progress_id=progress_id)
+        progress_store[progress_id]['progress'] = 40
+        
+        try:
+            raw_result = CLIENT.infer(filepath, model_id=PROJECT_ID)
+            progress_store[progress_id]['progress'] = 70
+        except HTTPCallErrorError as e:
+            if e.status_code == 413:
+                compress_image(filepath, max_size_mb=2, progress_id=progress_id)
+                try:
+                    raw_result = CLIENT.infer(filepath, model_id=PROJECT_ID)
+                    progress_store[progress_id]['progress'] = 70
+                except HTTPCallErrorError as retry_error:
+                    if retry_error.status_code == 413:
+                        progress_store[progress_id]['error'] = "Image too large after compression"
+                        progress_store[progress_id]['status'] = 'error'
+                        return
+                    raise retry_error
+            else:
+                raise e
+
+        result = raw_result.copy()
+        result['predictions'] = non_max_suppression(result['predictions'])
+        progress_store[progress_id]['progress'] = 80
+
+        img = Image.open(filepath).convert("RGB")
+        draw = ImageDraw.Draw(img)
+
+        damage_classes = [
+            "Blue-eye Mold damage", "Drier damage", "Insect damage",
+            "Mold damage", "Sprout damage", "Surface Mold", "cracked"
+        ]
+        heat_damage_classes = ["Heat damage"]
+        class_colors = {
+            "Normal": "blue",
+            "Mold damage": "red",
+            "Blue-eye Mold damage": "darkred"
+        }
+
+        counts = {}
+        for pred in result['predictions']:
+            label = pred['class']
+            counts[label] = counts.get(label, 0) + 1
+            if label not in class_colors:
+                class_colors[label] = "#%06x" % random.randint(0, 0xFFFFFF)
+
+            color = class_colors[label]
+            x0 = pred['x'] - pred['width'] / 2
+            y0 = pred['y'] - pred['height'] / 2
+            x1 = pred['x'] + pred['width'] / 2
+            y1 = pred['y'] + pred['height'] / 2
+            draw.rectangle([x0, y0, x1, y1], outline=color, width=2)
+            draw.text((x0, y0 - 10), label, fill=color)
+
+        normal_count = counts.get("Normal", 0)
+        total_kernels = sum(counts.values())
+        damage_kernels = total_kernels - normal_count
+
+        total_damage_pct = (damage_kernels / total_kernels) * 100 if total_kernels else 0
+        heat_damage_count = sum(counts.get(c, 0) for c in heat_damage_classes)
+        heat_damage_pct = (heat_damage_count / total_kernels) * 100 if total_kernels else 0
+
+        grade = classify_grade(total_damage_pct, damage_kernels, heat_damage_pct, heat_damage_count, total_kernels)
+
+        output_path = os.path.join(RESULT_FOLDER, filename)
+        img.save(output_path)
+        progress_store[progress_id]['progress'] = 90
+
+        result_data = {
+            'counts': counts,
+            'grade': grade,
+            'total_damage_pct': round(total_damage_pct, 2),
+            'heat_damage_pct': round(heat_damage_pct, 2),
+            'total_kernels': total_kernels,
+            'filename': filename,
+            'raw_result': raw_result
+        }
+        
+        progress_store[progress_id]['result'] = result_data
+        progress_store[progress_id]['progress'] = 100
+        progress_store[progress_id]['status'] = 'completed'
+        
+    except Exception as e:
+        progress_store[progress_id]['error'] = str(e)
+        progress_store[progress_id]['status'] = 'error'
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    file = request.files['image']
+    moisture = float(request.form.get("moisture", 0))
+    weight = float(request.form.get("weight", 0))
+    
+    progress_id = str(uuid.uuid4())
+    
+    thread = threading.Thread(target=process_image_async, args=(file, moisture, weight, progress_id))
+    thread.start()
+    
+    return jsonify({'progress_id': progress_id})
+
+@app.route("/progress/<progress_id>")
+def get_progress(progress_id):
+    if progress_id not in progress_store:
+        return jsonify({'error': 'Invalid progress ID'}), 404
+    
+    data = progress_store[progress_id].copy()
+    
+    if data['status'] == 'completed' and progress_id in progress_store:
+        del progress_store[progress_id]
+    
+    return jsonify(data)
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -100,7 +251,11 @@ def index():
         moisture = float(request.form.get("moisture", 0))
         weight = float(request.form.get("weight", 0))
 
-        filename = str(uuid.uuid4()) + os.path.splitext(file.filename)[-1]
+        file_ext = os.path.splitext(file.filename)[-1].lower()
+        if file_ext in ['.heic', '.heif'] and not HEIC_SUPPORT:
+            return f"<h1>Error: HEIC files not supported</h1><p>Please install pillow-heif or convert to JPG/PNG.</p><a href='/'>Back</a>"
+
+        filename = str(uuid.uuid4()) + ('.jpg' if file_ext in ['.heic', '.heif'] else file_ext)
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
 
