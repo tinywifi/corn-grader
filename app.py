@@ -1,4 +1,5 @@
 from flask import Flask, request, render_template_string, send_from_directory, jsonify
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from PIL import Image, ImageDraw
 from PIL.ExifTags import TAGS
 from inference_sdk import InferenceHTTPClient, InferenceConfiguration
@@ -24,7 +25,10 @@ CLIENT.configure(InferenceConfiguration(confidence_threshold=0.10))
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULT_FOLDER, exist_ok=True)
 app = Flask(__name__)
-CORS(app)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
+CORS(app, origins=["https://corn-grader.lovable.app"])
+
+socketio = SocketIO(app, cors_allowed_origins=["https://corn-grader.lovable.app"])
 
 progress_store = {}
 
@@ -86,8 +90,14 @@ def classify_grade(damage_pct, damage_kernels, heat_pct, heat_kernels, total_ker
 
 def compress_image(image_path, max_size_mb=5, quality=85, progress_id=None):
     def update_progress(step, total):
-        if progress_id and progress_id in progress_store:
-            progress_store[progress_id]['progress'] = int((step / total) * 30) + 10
+        progress = int((step / total) * 30) + 10
+        if progress_id:
+            socketio.emit('progress_update', {
+                'progress_id': progress_id,
+                'progress': progress,
+                'status': 'processing',
+                'message': 'Compressing image...'
+            }, room=progress_id)
     
     with Image.open(image_path) as img:
         img = img.convert("RGB")
@@ -118,26 +128,37 @@ def compress_image(image_path, max_size_mb=5, quality=85, progress_id=None):
             quality = max(20, quality - 20)
 
 def process_image_async(filepath, filename, moisture, weight, progress_id):
+    def emit_progress(progress, message, status='processing'):
+        socketio.emit('progress_update', {
+            'progress_id': progress_id,
+            'progress': progress,
+            'status': status,
+            'message': message
+        }, room=progress_id)
+    
     try:
-        progress_store[progress_id] = {'progress': 0, 'status': 'processing', 'result': None, 'error': None}
-        progress_store[progress_id]['progress'] = 5
+        emit_progress(5, 'Starting image processing...')
         
         compress_image(filepath, progress_id=progress_id)
-        progress_store[progress_id]['progress'] = 40
+        emit_progress(40, 'Sending to AI model...')
         
         try:
             raw_result = CLIENT.infer(filepath, model_id=PROJECT_ID)
-            progress_store[progress_id]['progress'] = 70
+            emit_progress(70, 'Processing AI results...')
         except HTTPCallErrorError as e:
             if e.status_code == 413:
+                emit_progress(45, 'Image too large, compressing further...')
                 compress_image(filepath, max_size_mb=2, progress_id=progress_id)
                 try:
                     raw_result = CLIENT.infer(filepath, model_id=PROJECT_ID)
-                    progress_store[progress_id]['progress'] = 70
+                    emit_progress(70, 'Processing AI results...')
                 except HTTPCallErrorError as retry_error:
                     if retry_error.status_code == 413:
-                        progress_store[progress_id]['error'] = "Image too large after compression"
-                        progress_store[progress_id]['status'] = 'error'
+                        socketio.emit('progress_update', {
+                            'progress_id': progress_id,
+                            'status': 'error',
+                            'error': 'Image too large after compression'
+                        }, room=progress_id)
                         return
                     raise retry_error
             else:
@@ -145,7 +166,7 @@ def process_image_async(filepath, filename, moisture, weight, progress_id):
 
         result = raw_result.copy()
         result['predictions'] = non_max_suppression(result['predictions'])
-        progress_store[progress_id]['progress'] = 80
+        emit_progress(80, 'Analyzing kernels...')
 
         img = Image.open(filepath).convert("RGB")
         draw = ImageDraw.Draw(img)
@@ -188,7 +209,7 @@ def process_image_async(filepath, filename, moisture, weight, progress_id):
 
         output_path = os.path.join(RESULT_FOLDER, filename)
         img.save(output_path)
-        progress_store[progress_id]['progress'] = 90
+        emit_progress(90, 'Generating report...')
 
         result_data = {
             'counts': counts,
@@ -200,13 +221,20 @@ def process_image_async(filepath, filename, moisture, weight, progress_id):
             'raw_result': raw_result
         }
         
-        progress_store[progress_id]['result'] = result_data
-        progress_store[progress_id]['progress'] = 100
-        progress_store[progress_id]['status'] = 'completed'
+        socketio.emit('progress_update', {
+            'progress_id': progress_id,
+            'progress': 100,
+            'status': 'completed',
+            'message': 'Analysis complete!',
+            'result': result_data
+        }, room=progress_id)
         
     except Exception as e:
-        progress_store[progress_id]['error'] = str(e)
-        progress_store[progress_id]['status'] = 'error'
+        socketio.emit('progress_update', {
+            'progress_id': progress_id,
+            'status': 'error',
+            'error': str(e)
+        }, room=progress_id)
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
@@ -228,6 +256,16 @@ def analyze():
     thread.start()
     
     return jsonify({'progress_id': progress_id})
+
+@socketio.on('join_progress')
+def on_join_progress(data):
+    progress_id = data['progress_id']
+    join_room(progress_id)
+    emit('joined', {'progress_id': progress_id})
+
+@socketio.on('disconnect')
+def on_disconnect():
+    print('Client disconnected')
 
 @app.route("/progress/<progress_id>")
 def get_progress(progress_id):
@@ -356,5 +394,5 @@ def result_image(filename):
     return send_from_directory(RESULT_FOLDER, filename)
 
 if __name__ == "__main__":
-    from waitress import serve
-    serve(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    socketio.run(app, host="0.0.0.0", port=port, debug=False)
