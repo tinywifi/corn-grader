@@ -1,7 +1,8 @@
 from flask import Flask, request, render_template_string, send_from_directory
 from PIL import Image, ImageDraw
 from inference_sdk import InferenceHTTPClient, InferenceConfiguration
-import os, uuid, json, random
+from inference_sdk.http.errors import HTTPCallErrorError
+import os, uuid, json, random, io
 import numpy as np
 from flask_cors import CORS
 
@@ -74,6 +75,24 @@ def classify_grade(damage_pct, damage_kernels, heat_pct, heat_kernels, total_ker
                 return grade
     return "Sample Grade"
 
+def compress_image(image_path, max_size_mb=5, quality=85):
+    with Image.open(image_path) as img:
+        img = img.convert("RGB")
+        
+        while True:
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG', quality=quality, optimize=True)
+            size_mb = buffer.tell() / (1024 * 1024)
+            
+            if size_mb <= max_size_mb or quality <= 10:
+                with open(image_path, 'wb') as f:
+                    f.write(buffer.getvalue())
+                return size_mb
+            
+            quality -= 10
+            if img.size[0] > 1920 or img.size[1] > 1920:
+                img = img.resize((int(img.size[0] * 0.8), int(img.size[1] * 0.8)), Image.Resampling.LANCZOS)
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
@@ -85,7 +104,21 @@ def index():
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
 
-        raw_result = CLIENT.infer(filepath, model_id=PROJECT_ID)
+        compress_image(filepath)
+
+        try:
+            raw_result = CLIENT.infer(filepath, model_id=PROJECT_ID)
+        except HTTPCallErrorError as e:
+            if e.status_code == 413:
+                compress_image(filepath, max_size_mb=2)
+                try:
+                    raw_result = CLIENT.infer(filepath, model_id=PROJECT_ID)
+                except HTTPCallErrorError as retry_error:
+                    if retry_error.status_code == 413:
+                        return f"<h1>Error: Image too large</h1><p>Please upload a smaller image file.</p><a href='/'>Back</a>"
+                    raise retry_error
+            else:
+                raise e
         result = raw_result.copy()
         result['predictions'] = non_max_suppression(result['predictions'])
 
