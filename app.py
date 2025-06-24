@@ -1,9 +1,9 @@
-from flask import Flask, request, render_template_string, send_from_directory, jsonify, Response
+from flask import Flask, request, render_template_string, send_from_directory, jsonify
 from PIL import Image, ImageDraw
 from PIL.ExifTags import TAGS
 from inference_sdk import InferenceHTTPClient, InferenceConfiguration
 from inference_sdk.http.errors import HTTPCallErrorError
-import os, uuid, json, random, io, threading, time, queue
+import os, uuid, json, random, io, threading, time
 import numpy as np
 from flask_cors import CORS
 try:
@@ -24,10 +24,8 @@ CLIENT.configure(InferenceConfiguration(confidence_threshold=0.10))
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULT_FOLDER, exist_ok=True)
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
-CORS(app, origins=["https://corn-grader.lovable.app"])
+CORS(app)
 
-progress_queues = {}
 progress_store = {}
 
 USDA_GRADES = [
@@ -89,15 +87,8 @@ def classify_grade(damage_pct, damage_kernels, heat_pct, heat_kernels, total_ker
 def compress_image(image_path, max_size_mb=5, quality=85, progress_id=None):
     def update_progress(step, total):
         progress = int((step / total) * 30) + 10
-        if progress_id and progress_id in progress_queues:
-            try:
-                progress_queues[progress_id].put({
-                    'progress': progress,
-                    'status': 'processing',
-                    'message': 'Compressing image...'
-                }, block=False)
-            except queue.Full:
-                pass
+        if progress_id and progress_id in progress_store:
+            progress_store[progress_id]['progress'] = progress
     
     with Image.open(image_path) as img:
         img = img.convert("RGB")
@@ -128,43 +119,26 @@ def compress_image(image_path, max_size_mb=5, quality=85, progress_id=None):
             quality = max(20, quality - 20)
 
 def process_image_async(filepath, filename, moisture, weight, progress_id):
-    def emit_progress(progress, message, status='processing'):
-        if progress_id in progress_queues:
-            try:
-                progress_queues[progress_id].put({
-                    'progress': progress,
-                    'status': status,
-                    'message': message
-                }, block=False)
-            except queue.Full:
-                pass
-    
     try:
-        emit_progress(5, 'Starting image processing...')
+        progress_store[progress_id] = {'progress': 0, 'status': 'processing', 'result': None, 'error': None}
+        progress_store[progress_id]['progress'] = 5
         
         compress_image(filepath, progress_id=progress_id)
-        emit_progress(40, 'Sending to AI model...')
+        progress_store[progress_id]['progress'] = 40
         
         try:
             raw_result = CLIENT.infer(filepath, model_id=PROJECT_ID)
-            emit_progress(70, 'Processing AI results...')
+            progress_store[progress_id]['progress'] = 70
         except HTTPCallErrorError as e:
             if e.status_code == 413:
-                emit_progress(45, 'Image too large, compressing further...')
                 compress_image(filepath, max_size_mb=2, progress_id=progress_id)
                 try:
                     raw_result = CLIENT.infer(filepath, model_id=PROJECT_ID)
-                    emit_progress(70, 'Processing AI results...')
+                    progress_store[progress_id]['progress'] = 70
                 except HTTPCallErrorError as retry_error:
                     if retry_error.status_code == 413:
-                        if progress_id in progress_queues:
-                            try:
-                                progress_queues[progress_id].put({
-                                    'status': 'error',
-                                    'error': 'Image too large after compression'
-                                }, block=False)
-                            except queue.Full:
-                                pass
+                        progress_store[progress_id]['error'] = "Image too large after compression"
+                        progress_store[progress_id]['status'] = 'error'
                         return
                     raise retry_error
             else:
@@ -172,7 +146,7 @@ def process_image_async(filepath, filename, moisture, weight, progress_id):
 
         result = raw_result.copy()
         result['predictions'] = non_max_suppression(result['predictions'])
-        emit_progress(80, 'Analyzing kernels...')
+        progress_store[progress_id]['progress'] = 80
 
         img = Image.open(filepath).convert("RGB")
         draw = ImageDraw.Draw(img)
@@ -215,7 +189,7 @@ def process_image_async(filepath, filename, moisture, weight, progress_id):
 
         output_path = os.path.join(RESULT_FOLDER, filename)
         img.save(output_path)
-        emit_progress(90, 'Generating report...')
+        progress_store[progress_id]['progress'] = 90
 
         result_data = {
             'counts': counts,
@@ -227,26 +201,13 @@ def process_image_async(filepath, filename, moisture, weight, progress_id):
             'raw_result': raw_result
         }
         
-        if progress_id in progress_queues:
-            try:
-                progress_queues[progress_id].put({
-                    'progress': 100,
-                    'status': 'completed',
-                    'message': 'Analysis complete!',
-                    'result': result_data
-                }, block=False)
-            except queue.Full:
-                pass
+        progress_store[progress_id]['result'] = result_data
+        progress_store[progress_id]['progress'] = 100
+        progress_store[progress_id]['status'] = 'completed'
         
     except Exception as e:
-        if progress_id in progress_queues:
-            try:
-                progress_queues[progress_id].put({
-                    'status': 'error',
-                    'error': str(e)
-                }, block=False)
-            except queue.Full:
-                pass
+        progress_store[progress_id]['error'] = str(e)
+        progress_store[progress_id]['status'] = 'error'
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
@@ -255,7 +216,6 @@ def analyze():
     weight = float(request.form.get("weight", 0))
     
     progress_id = str(uuid.uuid4())
-    progress_queues[progress_id] = queue.Queue(maxsize=100)
     
     file_ext = os.path.splitext(file.filename)[-1].lower()
     if file_ext in ['.heic', '.heif'] and not HEIC_SUPPORT:
@@ -269,41 +229,6 @@ def analyze():
     thread.start()
     
     return jsonify({'progress_id': progress_id})
-
-@app.route("/stream/<progress_id>")
-def stream_progress(progress_id):
-    def generate():
-        if progress_id not in progress_queues:
-            yield f"data: {json.dumps({'error': 'Invalid progress ID'})}\n\n"
-            return
-            
-        try:
-            while True:
-                try:
-                    data = progress_queues[progress_id].get(timeout=30)
-                    yield f"data: {json.dumps(data)}\n\n"
-                    
-                    if data.get('status') in ['completed', 'error']:
-                        del progress_queues[progress_id]
-                        break
-                        
-                except queue.Empty:
-                    yield f"data: {json.dumps({'ping': True})}\n\n"
-                    
-        except GeneratorExit:
-            if progress_id in progress_queues:
-                del progress_queues[progress_id]
-    
-    return Response(
-        generate(),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': 'https://corn-grader.lovable.app',
-            'Access-Control-Allow-Credentials': 'true'
-        }
-    )
 
 @app.route("/progress/<progress_id>")
 def get_progress(progress_id):
