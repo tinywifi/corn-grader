@@ -117,20 +117,9 @@ def compress_image(image_path, max_size_mb=5, quality=85, progress_id=None):
             
             quality = max(20, quality - 20)
 
-def process_image_async(file, moisture, weight, progress_id):
+def process_image_async(filepath, filename, moisture, weight, progress_id):
     try:
         progress_store[progress_id] = {'progress': 0, 'status': 'processing', 'result': None, 'error': None}
-        
-        file_ext = os.path.splitext(file.filename)[-1].lower()
-        if file_ext in ['.heic', '.heif'] and not HEIC_SUPPORT:
-            progress_store[progress_id]['error'] = "HEIC files not supported. Install pillow-heif."
-            progress_store[progress_id]['status'] = 'error'
-            return
-            
-        filename = str(uuid.uuid4()) + ('.jpg' if file_ext in ['.heic', '.heif'] else file_ext)
-        filepath = os.path.join(UPLOAD_FOLDER, filename)
-        file.save(filepath)
-        
         progress_store[progress_id]['progress'] = 5
         
         compress_image(filepath, progress_id=progress_id)
@@ -227,7 +216,15 @@ def analyze():
     
     progress_id = str(uuid.uuid4())
     
-    thread = threading.Thread(target=process_image_async, args=(file, moisture, weight, progress_id))
+    file_ext = os.path.splitext(file.filename)[-1].lower()
+    if file_ext in ['.heic', '.heif'] and not HEIC_SUPPORT:
+        return jsonify({'error': 'HEIC files not supported. Install pillow-heif.'}), 400
+        
+    filename = str(uuid.uuid4()) + ('.jpg' if file_ext in ['.heic', '.heif'] else file_ext)
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    file.save(filepath)
+    
+    thread = threading.Thread(target=process_image_async, args=(filepath, filename, moisture, weight, progress_id))
     thread.start()
     
     return jsonify({'progress_id': progress_id})
