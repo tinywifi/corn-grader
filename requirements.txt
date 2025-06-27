@@ -5,3 +5,4 @@ pillow-heif
 numpy
 inference-sdk
 flask_cors
+prometheus-flask-exporter
