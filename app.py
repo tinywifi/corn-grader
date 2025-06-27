@@ -1,5 +1,6 @@
 from flask import Flask, request, render_template_string, send_from_directory, jsonify
 from PIL import Image, ImageDraw
+from prometheus_flask_exporter import PrometheusMetrics
 from PIL.ExifTags import TAGS
 from inference_sdk import InferenceHTTPClient, InferenceConfiguration
 from inference_sdk.http.errors import HTTPCallErrorError
@@ -24,6 +25,7 @@ CLIENT.configure(InferenceConfiguration(confidence_threshold=0.10))
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULT_FOLDER, exist_ok=True)
 app = Flask(__name__)
+metrics = PrometheusMetrics(app)
 CORS(app)
 
 progress_store = {}
